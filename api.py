@@ -277,7 +277,7 @@ def _generate_pdf(result: dict, out_path: str):
         pdf.set_x(15)
         pdf.set_font("Helvetica","B",12)
         pdf.set_text_color(r,g,b)
-        pdf.cell(PAGE_W,8,f"{pred}  —  {prob:.1f}% pass probability  ({conf} confidence)",ln=True)
+        pdf.cell(PAGE_W,8,f"{pred}  -  {prob:.1f}% pass probability  ({conf} confidence)",ln=True)
         pdf.ln(3)
 
     def kw_section(title, items, r, g, b):
