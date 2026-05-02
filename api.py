@@ -53,6 +53,9 @@ def get_pipeline() -> ATSPipeline:
 # ── In-memory history (last 50 analyses) ─────────────────────────────
 history: deque = deque(maxlen=50)
 
+# ── Cache last result for PDF generation (avoids re-running pipeline) ─
+_last_result: dict = {}
+
 # ─────────────────────────────────────────────────────────────────────
 # Routes
 # ─────────────────────────────────────────────────────────────────────
@@ -106,6 +109,10 @@ async def analyze(
         result["resume_file"]  = resume.filename or "resume"
         result["analyzed_at"]  = datetime.utcnow().isoformat()
 
+        # Cache result for PDF generation
+        _last_result.clear()
+        _last_result.update(result)
+
         # Store in history
         history_entry = {
             "analysis_id":       analysis_id,
@@ -139,43 +146,42 @@ async def analyze_and_get_pdf(
     job_description: str = Form(...),
 ):
     """
-    Same as /analyze but returns a downloadable PDF report.
+    Generates a PDF from the most recent cached analysis result.
+    Avoids re-running the full ML pipeline a second time.
     """
-    ext = os.path.splitext(resume.filename or "resume.txt")[1].lower()
-    tmp_path = None
+    from starlette.background import BackgroundTask
+
+    def _cleanup(path: str):
+        try:
+            if os.path.exists(path):
+                os.unlink(path)
+        except Exception:
+            pass
+
     pdf_path = None
-    report_path = None
-
     try:
-        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
-            tmp.write(await resume.read())
-            tmp_path = tmp.name
+        # Use cached result if available, otherwise run pipeline
+        if _last_result:
+            result = _last_result.copy()
+        else:
+            # Fallback: run pipeline if no cached result exists
+            ext = os.path.splitext(resume.filename or "resume.txt")[1].lower()
+            tmp_path = None
+            report_path = None
+            try:
+                with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+                    tmp.write(await resume.read())
+                    tmp_path = tmp.name
+                report_path = tempfile.mktemp(suffix=".json")
+                pipeline = get_pipeline()
+                result = pipeline.run(tmp_path, job_description, report_path)
+            finally:
+                for p in [tmp_path, report_path]:
+                    if p and os.path.exists(p):
+                        os.unlink(p)
 
-        report_path = tempfile.mktemp(suffix=".json")
-        pipeline = get_pipeline()
-        result = pipeline.run(tmp_path, job_description, report_path)
-
-        # Generate PDF
         pdf_path = tempfile.mktemp(suffix=".pdf")
         _generate_pdf(result, pdf_path)
-
-        # Clean up input files now — pdf_path must stay alive until after response is sent
-        if tmp_path and os.path.exists(tmp_path):
-            os.unlink(tmp_path)
-            tmp_path = None
-        if report_path and os.path.exists(report_path):
-            os.unlink(report_path)
-            report_path = None
-
-        # BackgroundTask deletes the PDF *after* FileResponse finishes streaming it
-        from starlette.background import BackgroundTask
-
-        def _cleanup(path: str):
-            try:
-                if os.path.exists(path):
-                    os.unlink(path)
-            except Exception:
-                pass
 
         return FileResponse(
             pdf_path,
@@ -184,13 +190,8 @@ async def analyze_and_get_pdf(
             background=BackgroundTask(_cleanup, pdf_path),
         )
     except Exception as e:
-        # Clean up everything on error
-        for path in [tmp_path, report_path, pdf_path]:
-            if path and os.path.exists(path):
-                try:
-                    os.unlink(path)
-                except Exception:
-                    pass
+        if pdf_path and os.path.exists(pdf_path):
+            os.unlink(pdf_path)
         raise HTTPException(status_code=500, detail=str(e))
 
 
