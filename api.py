@@ -1,0 +1,317 @@
+"""
+ATS Resume Analyzer — FastAPI Backend
+Deploy on Render.com: https://ats-api.onrender.com
+
+Endpoints:
+  POST /analyze          — analyze resume + JD, returns full result JSON
+  GET  /health           — health check
+  GET  /history          — last 50 analyses (in-memory, resets on redeploy)
+"""
+
+import os
+import tempfile
+import uuid
+from datetime import datetime
+from typing import Optional
+from collections import deque
+
+from fastapi import FastAPI, UploadFile, Form, HTTPException, File
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, FileResponse
+import uvicorn
+
+# ── Bootstrap path so app.* imports work ──────────────────────────────
+import sys
+sys.path.insert(0, os.path.dirname(__file__))
+
+from app.pipeline import ATSPipeline
+from app.report.report_generator import ReportGenerator
+
+app = FastAPI(
+    title="ATS Resume Analyzer API",
+    description="ML-powered resume analysis: BERT semantic matching + Logistic Regression",
+    version="2.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ── Lazy pipeline (loads LR model on first request) ───────────────────
+_pipeline: Optional[ATSPipeline] = None
+
+def get_pipeline() -> ATSPipeline:
+    global _pipeline
+    if _pipeline is None:
+        _pipeline = ATSPipeline(verbose=False, use_bert=False, use_lr=True)
+    return _pipeline
+
+# ── In-memory history (last 50 analyses) ─────────────────────────────
+history: deque = deque(maxlen=50)
+
+# ─────────────────────────────────────────────────────────────────────
+# Routes
+# ─────────────────────────────────────────────────────────────────────
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "version": "2.0.0", "timestamp": datetime.utcnow().isoformat()}
+
+
+@app.post("/analyze")
+async def analyze(
+    resume: UploadFile = File(..., description="Resume file (PDF, DOCX, or TXT)"),
+    job_description: str = Form(..., description="Full job description text"),
+):
+    """
+    Analyze a resume against a job description.
+    Returns full scoring result with keyword matches, skills gap, LR prediction.
+    """
+    if not job_description.strip():
+        raise HTTPException(status_code=400, detail="Job description cannot be empty.")
+
+    ext = os.path.splitext(resume.filename or "resume.txt")[1].lower()
+    if ext not in (".pdf", ".docx", ".doc", ".txt"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type '{ext}'. Use PDF, DOCX, or TXT."
+        )
+
+    # Save upload to temp file
+    tmp_path = None
+    report_path = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+            content = await resume.read()
+            if len(content) > 10 * 1024 * 1024:  # 10MB limit
+                raise HTTPException(status_code=413, detail="File too large (max 10MB).")
+            tmp.write(content)
+            tmp_path = tmp.name
+
+        report_path = tempfile.mktemp(suffix=".json")
+        pipeline = get_pipeline()
+        result = pipeline.run(
+            resume_path=tmp_path,
+            job_description=job_description,
+            output_path=report_path,
+        )
+
+        # Add metadata
+        analysis_id = str(uuid.uuid4())[:8]
+        result["analysis_id"]  = analysis_id
+        result["resume_file"]  = resume.filename or "resume"
+        result["analyzed_at"]  = datetime.utcnow().isoformat()
+
+        # Store in history
+        history_entry = {
+            "analysis_id":       analysis_id,
+            "resume_file":       resume.filename or "resume",
+            "ats_score":         result.get("ats_score", 0),
+            "keyword_match_score": result.get("keyword_match_score", 0),
+            "skills_score":      result.get("skills_score", 0),
+            "experience_score":  result.get("experience_score", 0),
+            "format_score":      result.get("format_score", 0),
+            "lr_prediction":     result.get("lr_prediction"),
+            "analyzed_at":       result["analyzed_at"],
+        }
+        history.appendleft(history_entry)
+
+        return JSONResponse(content=result)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        if report_path and os.path.exists(report_path):
+            os.unlink(report_path)
+
+
+@app.post("/analyze/pdf-report")
+async def analyze_and_get_pdf(
+    resume: UploadFile = File(...),
+    job_description: str = Form(...),
+):
+    """
+    Same as /analyze but returns a downloadable PDF report.
+    """
+    ext = os.path.splitext(resume.filename or "resume.txt")[1].lower()
+    tmp_path = None
+    pdf_path = None
+    report_path = None
+
+    try:
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+            tmp.write(await resume.read())
+            tmp_path = tmp.name
+
+        report_path = tempfile.mktemp(suffix=".json")
+        pipeline = get_pipeline()
+        result = pipeline.run(tmp_path, job_description, report_path)
+
+        # Generate PDF
+        pdf_path = tempfile.mktemp(suffix=".pdf")
+        _generate_pdf(result, pdf_path)
+
+        # Clean up input files now — pdf_path must stay alive until after response is sent
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+            tmp_path = None
+        if report_path and os.path.exists(report_path):
+            os.unlink(report_path)
+            report_path = None
+
+        # BackgroundTask deletes the PDF *after* FileResponse finishes streaming it
+        from starlette.background import BackgroundTask
+
+        def _cleanup(path: str):
+            try:
+                if os.path.exists(path):
+                    os.unlink(path)
+            except Exception:
+                pass
+
+        return FileResponse(
+            pdf_path,
+            media_type="application/pdf",
+            filename=f"ATS_Report_{datetime.utcnow().strftime('%Y%m%d_%H%M')}.pdf",
+            background=BackgroundTask(_cleanup, pdf_path),
+        )
+    except Exception as e:
+        # Clean up everything on error
+        for path in [tmp_path, report_path, pdf_path]:
+            if path and os.path.exists(path):
+                try:
+                    os.unlink(path)
+                except Exception:
+                    pass
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/history")
+def get_history():
+    """Returns last 50 analyses (resets when server restarts)."""
+    return {"history": list(history), "count": len(history)}
+
+
+@app.delete("/history")
+def clear_history():
+    history.clear()
+    return {"message": "History cleared."}
+
+
+# ── PDF helper ────────────────────────────────────────────────────────
+def _generate_pdf(result: dict, out_path: str):
+    from fpdf import FPDF
+    import datetime as dt
+
+    pdf = FPDF()
+    pdf.set_margins(15, 15, 15)
+    pdf.set_auto_page_break(auto=True, margin=20)
+    pdf.add_page()
+    PAGE_W = 180
+
+    pdf.set_fill_color(30, 33, 48)
+    pdf.rect(0, 0, 210, 28, "F")
+    pdf.set_xy(15, 5)
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.set_text_color(255, 255, 255)
+    pdf.cell(PAGE_W, 10, "ATS Resume Analysis Report", ln=True, align="C")
+    pdf.set_x(15)
+    pdf.set_font("Helvetica", "", 8)
+    pdf.set_text_color(180, 180, 180)
+    pdf.cell(PAGE_W, 8,
+        f"Generated: {dt.datetime.now().strftime('%Y-%m-%d %H:%M')}  |  "
+        f"File: {result.get('resume_file','')[:40]}", ln=True, align="C")
+    pdf.ln(8)
+
+    def section(title):
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.set_text_color(30, 30, 30)
+        pdf.set_x(15)
+        pdf.cell(PAGE_W, 7, title, ln=True)
+        pdf.set_draw_color(180, 180, 200)
+        pdf.line(15, pdf.get_y(), 195, pdf.get_y())
+        pdf.ln(3)
+
+    section("Score Summary")
+    scores = [
+        ("Overall ATS Score",   result.get("ats_score", 0)),
+        ("Keyword Match",       result.get("keyword_match_score", 0)),
+        ("Skills Match",        result.get("skills_score", 0)),
+        ("Experience Match",    result.get("experience_score", 0)),
+        ("Format Score",        result.get("format_score", 0)),
+    ]
+    for label, score in scores:
+        r, g, b = (16,185,129) if score>=70 else (245,158,11) if score>=45 else (239,68,68)
+        y = pdf.get_y()
+        pdf.set_x(15)
+        pdf.set_font("Helvetica", "", 10)
+        pdf.set_text_color(50, 50, 50)
+        pdf.cell(55, 8, label)
+        bar_x = 15 + 57
+        pdf.set_fill_color(220, 220, 230)
+        pdf.rect(bar_x, y+2, 90, 5, "F")
+        pdf.set_fill_color(r, g, b)
+        pdf.rect(bar_x, y+2, max(2, int(score/100*90)), 5, "F")
+        pdf.set_xy(bar_x+92, y)
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.set_text_color(r, g, b)
+        pdf.cell(25, 8, f"{score:.1f}/100", ln=True)
+    pdf.ln(4)
+
+    lr = result.get("lr_prediction")
+    if lr:
+        section("ATS Prediction")
+        pred = lr.get("prediction","N/A")
+        prob = lr.get("pass_probability",0)
+        conf = lr.get("confidence","")
+        r,g,b = (16,185,129) if pred=="PASS" else (239,68,68)
+        pdf.set_x(15)
+        pdf.set_font("Helvetica","B",12)
+        pdf.set_text_color(r,g,b)
+        pdf.cell(PAGE_W,8,f"{pred}  —  {prob:.1f}% pass probability  ({conf} confidence)",ln=True)
+        pdf.ln(3)
+
+    def kw_section(title, items, r, g, b):
+        if not items: return
+        section(title)
+        pdf.set_x(15)
+        pdf.set_font("Helvetica","",9)
+        pdf.set_text_color(r,g,b)
+        pdf.multi_cell(PAGE_W, 5, ",  ".join(str(i) for i in items[:30]))
+        pdf.ln(3)
+
+    kw_section("Matched Keywords",  result.get("matched_keywords",[]),  16,185,129)
+    kw_section("Missing Keywords",  result.get("missing_keywords",[]),  220,60,60)
+    kw_section("Matched Skills",    result.get("matched_skills",[]),    16,185,129)
+    kw_section("Missing Skills",    result.get("missing_skills",[]),    220,60,60)
+
+    suggestions = result.get("suggestions",[])
+    if suggestions:
+        section("Improvement Suggestions")
+        pdf.set_font("Helvetica","",10)
+        for i,s in enumerate(suggestions,1):
+            pdf.set_x(15)
+            pdf.set_text_color(99,102,241)
+            pdf.cell(7,6,f"{i}.")
+            pdf.set_text_color(40,40,40)
+            pdf.multi_cell(PAGE_W-7,6,str(s))
+        pdf.ln(3)
+
+    pdf.set_y(-15)
+    pdf.set_font("Helvetica","I",7)
+    pdf.set_text_color(150,150,150)
+    pdf.cell(PAGE_W,5,"ATS Resume Analyzer  |  BERT + Logistic Regression",align="C")
+
+    pdf.output(out_path)
+
+
+if __name__ == "__main__":
+    uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=True)
